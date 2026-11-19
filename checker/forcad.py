@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import sys
 
-from meko_checker import CHECK_FAILED, run
+from meko_checker import CHECK_FAILED, UP, Verdict, cleanup, run
 
 DEFAULT_CONFIG = "/etc/meko-checker/config.json"
 
@@ -19,9 +19,20 @@ DEFAULT_CONFIG = "/etc/meko-checker/config.json"
 def execute(config, request):
     """Chạy yêu cầu {task, action, ip, flag, locator} với cấu hình đã nạp."""
     team = config["teams"][request["ip"]]
+    lifecycle = request.get('lifecycle')
+    if request['action'] == 'prune' and not lifecycle:
+        return {'status': CHECK_FAILED, 'public': 'Lifecycle snapshot required', 'private': ''}
+    if lifecycle and request['action'] != 'get':
+        try:
+            cleanup(team['url'], team['staff_password'], lifecycle, float(config.get('timeout', 5)))
+        except Verdict as exc:
+            return {'status': exc.status, 'public': exc.public, 'private': exc.private}
+    if request['action'] == 'prune':
+        return {'status': UP, 'public': 'Pruned expired checker data', 'private': ''}
     return run(request["task"], request["action"], team["url"], team=team.get("team"),
                staff_password=team.get("staff_password", ""), flag=request.get("flag"),
-               private=request.get("locator"), timeout=float(config.get("timeout", 5)))
+               private=request.get("locator"), timeout=float(config.get("timeout", 5)),
+               key=request.get('key', request.get('locator')), lifecycle=lifecycle)
 
 
 def main(task):
@@ -32,6 +43,8 @@ def main(task):
             if len(sys.argv) != 6:
                 raise ValueError("invalid arguments")
             request.update(locator=sys.argv[3], flag=sys.argv[4])
+            if action == 'put':
+                request['key'] = sys.argv[3]
         elif action != "check" or len(sys.argv) != 3:
             raise ValueError("invalid arguments")
         path = Path(os.environ.get("MEKO_CHECKER_CONFIG", DEFAULT_CONFIG))

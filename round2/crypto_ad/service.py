@@ -25,6 +25,10 @@ CHALLENGES = {
     'ecdsa_nonce': ecdsa_nonce,
 }
 
+SQLITE_MAX_PAGES = 8192  # 32 MiB per challenge database.
+MAX_REQUESTS_PER_CONNECTION = 100
+MAX_CONNECTIONS_PER_SOURCE = 8
+
 
 class Service:
     def __init__(self, name, config):
@@ -37,7 +41,27 @@ class Service:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript('''CREATE TABLE IF NOT EXISTS secrets (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS flags (id TEXT PRIMARY KEY, value TEXT NOT NULL, tick INTEGER NOT NULL);''')
+                CREATE TABLE IF NOT EXISTS flags (id TEXT PRIMARY KEY, value TEXT NOT NULL, tick INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL);''')
+            db.execute('INSERT OR IGNORE INTO metadata VALUES (?, ?)', ('current_tick', -1))
+            newest_tick = db.execute('SELECT MAX(tick) FROM flags').fetchone()[0]
+            current_tick = db.execute(
+                'SELECT value FROM metadata WHERE key=?', ('current_tick',)
+            ).fetchone()[0]
+            current_tick = max(current_tick, newest_tick if newest_tick is not None else -1)
+            db.execute('UPDATE metadata SET value=? WHERE key=?',
+                       (current_tick, 'current_tick'))
+            if current_tick >= 0:
+                newest = db.execute(
+                    'SELECT id FROM flags WHERE tick=? ORDER BY id LIMIT 1',
+                    (current_tick,)
+                ).fetchone()
+                if newest:
+                    db.execute('DELETE FROM flags WHERE id<>?', (newest[0],))
+                else:
+                    db.execute('DELETE FROM flags')
+            else:
+                db.execute('DELETE FROM flags')
             for key in ('private', 'nonce', 'aes', 'mac'):
                 db.execute('INSERT OR IGNORE INTO secrets VALUES (?, ?)', (key, secrets.token_hex(32)))
             self.keys = dict(db.execute('SELECT key,value FROM secrets'))
@@ -48,9 +72,13 @@ class Service:
     def connect(self):
         db = sqlite3.connect(self.path, timeout=15)
         db.execute('PRAGMA journal_mode=WAL')
+        db.execute(f'PRAGMA max_page_count={SQLITE_MAX_PAGES}')
+        db.execute('PRAGMA busy_timeout=15000')
         return db
 
     def flag(self, record):
+        if not isinstance(record, str) or len(record) > 100:
+            raise ValueError('record')
         with self.connect() as db:
             row = db.execute('SELECT value FROM flags WHERE id=?', (record,)).fetchone()
         if not row:
@@ -63,26 +91,62 @@ class Service:
             return {'ok': True, 'service': self.name, 'protocol': 'line-json-v1',
                     'patched': self.patched,
                     'operations': CHALLENGES[self.name].OPERATIONS}
-        if op in ('put', 'get', 'prune'):
+        if op in ('put', 'get', 'prune', 'reset'):
             token = req.get('token', '')
             if not isinstance(token, str) or not hmac.compare_digest(token, self.config['admin_token']):
                 return {'ok': False, 'error': 'unauthorized'}
             if op == 'get':
                 return {'ok': True, 'flag': self.flag(req['record'])}
-            if op == 'prune':
+            if op == 'reset':
+                # Explicit administrative reset; a delayed PUT cannot reset a run.
                 with self.connect() as db:
-                    db.execute('DELETE FROM flags WHERE tick < ?', (int(req['before_tick']),))
+                    db.execute('BEGIN IMMEDIATE')
+                    db.execute('DELETE FROM flags')
+                    db.execute('UPDATE metadata SET value=-1 WHERE key=?', ('current_tick',))
+                return {'ok': True}
+            if op == 'prune':
+                before_tick = int(req['before_tick'])
+                if not 0 <= before_tick <= 1000000:
+                    raise ValueError('before_tick')
+                with self.connect() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    current_tick = db.execute(
+                        'SELECT value FROM metadata WHERE key=?', ('current_tick',)
+                    ).fetchone()[0]
+                    if before_tick > current_tick:
+                        db.execute('UPDATE metadata SET value=? WHERE key=?',
+                                   (before_tick, 'current_tick'))
+                    db.execute('DELETE FROM flags WHERE tick < ?', (before_tick,))
                 return {'ok': True}
             record, flag, tick = req['record'], req['flag'], int(req['tick'])
             if not isinstance(record, str) or not re.fullmatch(r'[a-f0-9]{24}', record):
                 raise ValueError('record')
             if not isinstance(flag, str) or not re.fullmatch(r'MekoDataCTF\{[a-f0-9]{32}\}', flag):
                 raise ValueError('flag')
+            if not 0 <= tick <= 1000000:
+                raise ValueError('tick')
             with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                current_tick = db.execute(
+                    'SELECT value FROM metadata WHERE key=?', ('current_tick',)
+                ).fetchone()[0]
+                if tick < current_tick:
+                    return {'ok': False, 'error': 'stale_tick'}
+                if tick > current_tick:
+                    db.execute('DELETE FROM flags')
+                    db.execute('UPDATE metadata SET value=? WHERE key=?',
+                               (tick, 'current_tick'))
                 existing = db.execute('SELECT value,tick FROM flags WHERE id=?', (record,)).fetchone()
                 if existing and existing != (flag, tick):
                     return {'ok': False, 'error': 'record_conflict'}
-                db.execute('INSERT OR IGNORE INTO flags VALUES (?,?,?)', (record, flag, tick))
+                if existing:
+                    # Repair any same-tick duplicate left by an older service build.
+                    db.execute('DELETE FROM flags WHERE id<>?', (record,))
+                else:
+                    # A challenge service has one active flag. A retried or
+                    # re-keyed PUT for this tick replaces its previous record.
+                    db.execute('DELETE FROM flags')
+                    db.execute('INSERT INTO flags(id,value,tick) VALUES (?,?,?)', (record, flag, tick))
             return {'ok': True, 'record': record}
         if op == 'targets':
             with self.connect() as db:
@@ -96,11 +160,13 @@ class Service:
             return {'ok': False, 'error': 'invalid_request'}
         try:
             return self.dispatch(req)
-        except (ValueError, KeyError, TypeError, AssertionError, OverflowError):
+        except (ValueError, KeyError, TypeError, AssertionError, OverflowError,
+                RecursionError, sqlite3.Error):
             return {'ok': False, 'error': 'invalid_request'}
 
 
 def serve_stream(service, source, output):
+    requests = 0
     while True:
         line = source.readline(MAX_LINE + 1)
         if not line:
@@ -111,10 +177,13 @@ def serve_stream(service, source, output):
             return
         try:
             result = service.handle(json.loads(line))
-        except (ValueError, UnicodeError):
+        except (ValueError, UnicodeError, RecursionError):
             result = {'ok': False, 'error': 'invalid_json'}
         output.write(json.dumps(result, separators=(',', ':')).encode() + b'\n')
         output.flush()
+        requests += 1
+        if requests >= MAX_REQUESTS_PER_CONNECTION:
+            return
 
 
 def main():
@@ -130,7 +199,17 @@ def main():
     if args.stdio:
         serve_stream(app, sys.stdin.buffer, sys.stdout.buffer)
         return
-    slots = threading.BoundedSemaphore(96)
+    slots = threading.BoundedSemaphore(24)
+    source_lock = threading.Lock()
+    source_connections = {}
+
+    def release_source(source):
+        with source_lock:
+            active = source_connections.get(source, 0) - 1
+            if active > 0:
+                source_connections[source] = active
+            else:
+                source_connections.pop(source, None)
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
@@ -145,13 +224,21 @@ def main():
         daemon_threads = True
 
         def process_request(self, request, address):
+            source = address[0]
+            with source_lock:
+                if source_connections.get(source, 0) >= MAX_CONNECTIONS_PER_SOURCE:
+                    request.close()
+                    return
+                source_connections[source] = source_connections.get(source, 0) + 1
             if not slots.acquire(blocking=False):
+                release_source(source)
                 request.close()
                 return
             try:
                 super().process_request(request, address)
             except Exception:
                 slots.release()
+                release_source(source)
                 raise
 
         def process_request_thread(self, request, address):
@@ -159,6 +246,7 @@ def main():
                 super().process_request_thread(request, address)
             finally:
                 slots.release()
+                release_source(address[0])
 
     with Server((args.host, args.port or SERVICES[args.service]), Handler) as server:
         print(f'{args.service} line-JSON listening on {args.host}:{server.server_address[1]}', flush=True)

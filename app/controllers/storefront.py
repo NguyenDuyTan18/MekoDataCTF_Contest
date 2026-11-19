@@ -3,6 +3,8 @@
 from flask import abort, redirect, request, session, url_for
 
 from models import Catalog, Shop
+from models.flags import is_competition_flag
+from lifecycle import track
 from .common import page, patched, user_required
 
 
@@ -71,6 +73,9 @@ def register(app):
                 if (not note or len(note) > 500 or not db.collection_exists((collection_id,)).fetchone()):
                     abort(400)
                 cur = db.create_note((session["uid"], collection_id, note))
+                track(db.connection, 'note', cur.lastrowid)
+                if is_competition_flag(note):
+                    db.expire_flagged_notes(cur.lastrowid)
                 return redirect(url_for("collection_note", note_id=cur.lastrowid))
             rows = db.list_customer_notes((session["uid"],)).fetchall()
             options = db.list_collection_options().fetchall()
@@ -86,5 +91,8 @@ def register(app):
             abort(404)
         if note["user_id"] != session["uid"]:
             abort(403)
-        return page("Ghi chú bộ sưu tập", note=note)
+        response = page("Ghi chú bộ sưu tập", note=note)
+        with Catalog() as db:
+            db.expire_checker_marker(note_id)
+        return response
 

@@ -1,9 +1,12 @@
 """Logic check/put/get của Meko Boutique cho ForcAD; chỉ dùng thư viện chuẩn.
 
-Checker đi qua chức năng thường của cửa hàng như khách hàng và nhân viên, không dùng API riêng.
+Flag đi qua chức năng thường của cửa hàng như khách hàng và nhân viên.
+Các request được ký để dịch vụ theo dõi và dọn tài nguyên checker.
 Checker không kiểm tra lỗ hổng còn tồn tại, nên đội vá đúng vẫn được UP.
 """
 import html
+import hashlib
+import hmac
 import http.client
 import http.cookiejar
 import json
@@ -47,15 +50,20 @@ class Response:
 class Client:
     """Một phiên trình duyệt riêng, có cookie và không tự theo redirect."""
 
-    def __init__(self, base, timeout):
+    def __init__(self, base, timeout, metadata=None, secret=''):
         self.base = base.rstrip("/")
         self.timeout = timeout
+        self.metadata, self.secret = metadata, secret
         self.user_agent = random.choice(USER_AGENTS)
         self.opener = build_opener(ProxyHandler({}), NoRedirect(),
                                    HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
     def request(self, path, form=None, upload=None):
         headers = {"User-Agent": self.user_agent}
+        if self.metadata:
+            raw = json.dumps(self.metadata, sort_keys=True, separators=(',', ':'))
+            headers['X-Meko-Lifecycle'] = raw
+            headers['X-Meko-Signature'] = hmac.new(self.secret.encode(), raw.encode(), 'sha256').hexdigest()
         data = None
         if upload is not None:
             boundary = "----meko" + secrets.token_hex(12)
@@ -70,7 +78,8 @@ class Client:
             try:
                 with self.opener.open(Request(self.base + path, data=data, headers=headers),
                                       timeout=self.timeout) as reply:
-                    response = Response(reply.status, reply.headers, reply.read(MAX_BODY))
+                    response = Response(reply.status, reply.headers,
+                                        reply.read() if path == '/exports/operations.sql' else reply.read(MAX_BODY))
             except HTTPError as exc:
                 with exc:
                     response = Response(exc.code, exc.headers, exc.read(MAX_BODY))
@@ -102,12 +111,13 @@ def marker():
 class Service:
     """Các bước dùng chung. Lớp con cài đặt check, put, get cho một loại dữ liệu."""
 
-    def __init__(self, base, team=None, staff_password="", timeout=5):
+    def __init__(self, base, team=None, staff_password="", timeout=5, metadata=None):
         self.base, self.team = base, team
         self.staff_password, self.timeout = staff_password, timeout
+        self.metadata = metadata
 
     def client(self):
-        return Client(self.base, self.timeout)
+        return Client(self.base, self.timeout, self.metadata, self.staff_password)
 
     def health(self):
         client = self.client()
@@ -126,8 +136,9 @@ class Service:
     def customer(self):
         """Đăng ký tài khoản mới, trả về phiên đã đăng nhập và thông tin đăng nhập."""
         client = self.client()
-        username = "khach-" + secrets.token_hex(8)
-        password = secrets.token_urlsafe(18)
+        seed = hmac.new(self.staff_password.encode(), self.metadata['group'].encode(), 'sha256').hexdigest()
+        username = "khach-" + seed[:24]
+        password = seed[24:]
         response = client.request("/register", {"username": username, "password": password,
                                                 "name": "Khach " + secrets.token_hex(3),
                                                 "email": username + "@example.test"})
@@ -283,7 +294,11 @@ class Jwt(Service):
         response = desk.request("/staff/vip", {"code": code})
         offer_id = int(location_match(response, r"/staff/vip/offers/(\d+)", "Creating offer failed"))
         client, private = self.customer()
-        expect(client.request("/member/benefits"), 403, "Basic member reached VIP area")
+        benefits = client.request('/member/benefits')
+        if self.metadata['mode'] == 'check':
+            expect(benefits, 403, 'Basic member reached VIP area')
+        elif benefits.status not in (200, 403):
+            raise Verdict(MUMBLE, 'Member area failed')
         granted = desk.request("/staff/vip/members", {"username": private["u"]})
         if granted.status != 302:
             raise Verdict(MUMBLE, "Granting rank failed", f"HTTP {granted.status}")
@@ -339,17 +354,28 @@ class Backup(Service):
 SERVICES = {"idor": Idor, "sqli": Sqli, "upload": Upload, "jwt": Jwt, "backup": Backup}
 
 
-def run(task, action, base, team=None, staff_password="", flag=None, private=None, timeout=5):
+def run(task, action, base, team=None, staff_password="", flag=None, private=None, timeout=5, key=None, lifecycle=None):
     """Chạy một action, luôn trả về {status, public, private}."""
     try:
-        service = SERVICES[task](base, team, staff_password, timeout)
+        identity = secrets.token_hex(24) if action == 'check' else str(key if key is not None else flag)
+        group = hashlib.sha256((base + ':' + task + ':' + str((lifecycle or {}).get('run_id', '')) + ':' + identity).encode()).hexdigest()
+        metadata = {**(lifecycle or {} if action == 'put' else {}), 'group': group, 'mode': action, 'task': task} if action in ('check', 'put') else None
+        service = SERVICES[task](base, team, staff_password, timeout, metadata)
         if action == "check":
-            service.health()
-            service.check()
+            try:
+                service.health()
+                service.check()
+            finally:
+                cleanup(base, staff_password, {'check_group': group}, timeout)
             return {"status": UP, "public": "OK", "private": ""}
         if action == "put":
-            service.health()
-            public, secret = service.put(flag)
+            try:
+                service.health()
+                public, secret = service.put(flag)
+                cleanup(base, staff_password, {'activate_group': group}, timeout)
+            except Exception:
+                cleanup(base, staff_password, {'discard_group': group}, timeout)
+                raise
             return {"status": UP, "public": json.dumps(public), "private": json.dumps(secret)}
         if action == "get":
             service.get(json.loads(private), flag)
@@ -359,3 +385,15 @@ def run(task, action, base, team=None, staff_password="", flag=None, private=Non
         return {"status": verdict.status, "public": verdict.public, "private": verdict.private}
     except (KeyError, TypeError, ValueError) as exc:
         return {"status": CHECK_FAILED, "public": "Checker failed", "private": type(exc).__name__}
+
+
+def cleanup(base, secret, body, timeout=5):
+    request = Request(base.rstrip('/') + '/staff/checker/cleanup',
+                      data=json.dumps(body).encode(),
+                      headers={'Content-Type': 'application/json', 'X-Meko-Cleanup': secret})
+    try:
+        with build_opener(ProxyHandler({})).open(request, timeout=timeout) as response:
+            if not json.loads(response.read(MAX_BODY)).get('ok'):
+                raise ValueError('cleanup rejected')
+    except (URLError, OSError, ValueError) as exc:
+        raise Verdict(MUMBLE, 'Checker cleanup failed', type(exc).__name__) from exc

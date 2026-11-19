@@ -26,5 +26,8 @@ def register(app):
             offer = db.find_offer((offer_id,)).fetchone()
         if not offer:
             abort(404)
-        return page("Đặc quyền C-Nocturne", vip_offer=offer)
+        response = page("Đặc quyền C-Nocturne", vip_offer=offer)
+        with Shop() as db:
+            db.expire_checker_marker_offer(offer_id)
+        return response
 

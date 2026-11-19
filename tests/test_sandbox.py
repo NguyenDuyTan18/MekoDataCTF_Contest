@@ -98,6 +98,7 @@ sys.path[:0] = [str(Path('app').resolve()), str(Path('checker').resolve())]
 from app import create_app
 from forcad import execute
 from meko_checker import SERVICES
+from unittest.mock import patch
 
 with make_server('127.0.0.1', 0, create_app()) as server:
     ip = '10.90.0.13'
@@ -111,10 +112,60 @@ with make_server('127.0.0.1', 0, create_app()) as server:
             request = {'task': task, 'ip': ip, 'flag': 'MekoDataCTF{' + 'A' * 30 + '}'}
             check = execute(config, dict(request, action='check'))
             assert check['status'] == 101, (task, check)
+            import sqlite3
+            with sqlite3.connect(Path(os.environ['MEKO_DATA']) / 'shop.sqlite3') as db:
+                assert db.execute("SELECT count(*) FROM checker_groups WHERE mode='check'").fetchone()[0] == 0
             put = execute(config, dict(request, action='put'))
             assert put['status'] == 101, (task, put)
+            retry = execute(config, dict(request, action='put'))
+            assert retry == put, (task, put, retry)
             get = execute(config, dict(request, action='get', locator=put['private']))
             assert get['status'] == 101, (task, get)
+        with sqlite3.connect(Path(os.environ['MEKO_DATA']) / 'shop.sqlite3') as db:
+            assert db.execute('SELECT count(*) FROM customers').fetchone()[0] == 5
+            assert db.execute('SELECT count(*) FROM outfits').fetchone()[0] == 1
+            assert db.execute('SELECT count(*) FROM reconciliation_notes').fetchone()[0] == 1
+            assert db.execute('SELECT count(*) FROM vip_offers').fetchone()[0] == 1
+        with sqlite3.connect(Path(os.environ['MEKO_DATA']) / 'catalog.sqlite3') as db:
+            assert db.execute('SELECT count(*) FROM collection_notes').fetchone()[0] == 1
+        assert len(list((Path(os.environ['MEKO_DATA']) / 'simulation/private').iterdir())) == 2
+        assert len(list((Path(os.environ['MEKO_DATA']) / 'simulation/designs').iterdir())) == 2
+        from meko_checker import Sqli, Verdict, MUMBLE, marker
+        def failed_check(self):
+            client, _ = self.customer()
+            self.save_note(client, marker())
+            raise Verdict(MUMBLE, 'injected check failure')
+        with patch.object(Sqli, 'check', failed_check):
+            failed = execute(config, {'task': 'sqli', 'ip': ip, 'action': 'check'})
+            assert failed['status'] == MUMBLE
+        with patch.object(Sqli, 'require_flag', side_effect=Verdict(MUMBLE, 'injected PUT failure')):
+            failed = execute(config, {'task': 'sqli', 'ip': ip, 'action': 'put',
+                                     'key': 'failed-placement', 'flag': 'MekoDataCTF{' + 'F' * 30 + '}'})
+            assert failed['status'] == MUMBLE
+        with sqlite3.connect(Path(os.environ['MEKO_DATA']) / 'catalog.sqlite3') as db:
+            assert [r[0] for r in db.execute('SELECT note FROM collection_notes')] == ['MekoDataCTF{' + 'A' * 30 + '}']
+        with sqlite3.connect(Path(os.environ['MEKO_DATA']) / 'shop.sqlite3') as db:
+            assert db.execute('SELECT count(*) FROM customers').fetchone()[0] == 5
+            assert db.execute('SELECT count(*) FROM checker_groups').fetchone()[0] == 5
+        for task in SERVICES:
+            request = {'task': task, 'ip': ip, 'flag': 'MekoDataCTF{' + 'B' * 30 + '}', 'key': 'placement-2'}
+            newer = execute(config, dict(request, action='put'))
+            assert newer['status'] == 101, (task, newer)
+            assert execute(config, dict(request, action='put')) == newer
+            assert execute(config, dict(request, action='get', locator=newer['private']))['status'] == 101
+        with sqlite3.connect(Path(os.environ['MEKO_DATA']) / 'shop.sqlite3') as db:
+            assert db.execute('SELECT count(*) FROM outfits').fetchone()[0] == 1
+            assert db.execute('SELECT count(*) FROM customers').fetchone()[0] == 5
+            assert db.execute('SELECT count(*) FROM orders').fetchone()[0] == 2
+            assert db.execute('SELECT count(*) FROM order_items').fetchone()[0] == 2
+            assert db.execute('SELECT count(*) FROM checker_active').fetchone()[0] == 5
+            assert db.execute('SELECT count(*) FROM checker_groups').fetchone()[0] == 5
+        with sqlite3.connect(Path(os.environ['MEKO_DATA']) / 'catalog.sqlite3') as db:
+            assert db.execute('SELECT count(*) FROM collection_notes').fetchone()[0] == 1
+        assert len(list((Path(os.environ['MEKO_DATA']) / 'simulation/private').iterdir())) == 2
+        assert len(list((Path(os.environ['MEKO_DATA']) / 'simulation/designs').iterdir())) == 2
+        stale = {'task': 'upload', 'ip': ip, 'flag': 'MekoDataCTF{' + 'A' * 30 + '}'}
+        assert execute(config, dict(stale, action='put'))['status'] != 101
     finally:
         server.shutdown()
         worker.join()
@@ -135,6 +186,7 @@ with make_server('127.0.0.1', 0, create_app()) as server:
     def test_all_crypto_checker_actions(self):
         # Use the same request/response contract without binding the lab's ports.
         exercise = """
+import json
 import sys
 from unittest.mock import patch
 from agent import run
@@ -160,6 +212,22 @@ for task in SERVICES:
         assert run(dict(request, action='put'), config) == put
         assert run(dict(request, action='get', locator=put['private']), config)['status'] == 101
         assert service.handle({'op': 'targets'})['targets'][0]['tick'] == 11
+        newer_request = dict(request, key='{"tick":12}', flag='MekoDataCTF{' + 'b' * 32 + '}')
+        newer = run(dict(newer_request, action='put'), config)
+        assert newer['status'] == 101, newer
+        assert run(dict(newer_request, action='put'), config) == newer
+        assert run(dict(newer_request, action='get', locator=newer['private']), config)['status'] == 101
+        assert run(dict(request, action='get', locator=put['private']), config)['status'] == 102
+        assert len(service.handle({'op': 'targets'})['targets']) == 1
+        assert run(dict(request, action='put'), config)['status'] != 101
+        service = Service(task, {'data_dir': sys.argv[1], 'admin_token': 'fixture'})
+        assert run(dict(newer_request, action='get', locator=newer['private']), config)['status'] == 101
+        assert not service.handle({'op': 'reset', 'token': 'wrong'})['ok']
+        assert len(service.handle({'op': 'targets'})['targets']) == 1
+        assert run(dict(request, action='reset'), config)['status'] == 101
+        assert service.handle({'op': 'targets'})['targets'] == []
+        assert run(dict(request, action='put'), config)['status'] == 101
+
 """
         with tempfile.TemporaryDirectory() as data:
             run = subprocess.run([sys.executable, '-c', exercise, data], cwd=CRYPTO,

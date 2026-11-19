@@ -1,5 +1,6 @@
 """Truy cập dữ liệu cửa hàng."""
 from .database import Repository
+from .flags import is_checker_marker, managed_resource, flagged_row_ids, delete_rows
 
 
 class Shop(Repository):
@@ -69,7 +70,7 @@ class Shop(Repository):
         return self.connection.execute('SELECT * FROM vip_offers WHERE id=?', parameters)
 
     def list_reconciliations(self):
-        return self.connection.execute('SELECT ref,value FROM reconciliation_notes ORDER BY id DESC LIMIT 100')
+        return self.connection.execute('SELECT ref,value FROM reconciliation_notes ORDER BY id DESC')
 
     def list_orders(self):
         return self.connection.execute('SELECT * FROM orders ORDER BY id DESC')
@@ -91,3 +92,37 @@ class Shop(Repository):
 
     def list_reconciliation_refs(self):
         return self.connection.execute('SELECT ref FROM reconciliation_notes ORDER BY id DESC LIMIT 100')
+
+    def expire_checker_marker_order(self, order_id):
+        if managed_resource('order', order_id):
+            return
+        row = self.find_order((order_id,)).fetchone()
+        if row and is_checker_marker(row['memo']):
+            # The functional check still needs to find the order in its list.
+            self.connection.execute('UPDATE orders SET memo=? WHERE id=?', ('', order_id))
+
+    def expire_flagged_orders(self, keep_id):
+        ids = flagged_row_ids(self.connection, 'orders', 'id', 'memo', keep_id)
+        delete_rows(self.connection, 'order_items', 'order_id', ids)
+        delete_rows(self.connection, 'orders', 'id', ids)
+
+    def expire_flagged_offers(self, keep_id):
+        delete_rows(self.connection, 'vip_offers', 'id',
+                    flagged_row_ids(self.connection, 'vip_offers', 'id', 'code', keep_id))
+
+    def expire_flagged_reconciliations(self, keep_ref):
+        delete_rows(self.connection, 'reconciliation_notes', 'ref',
+                    flagged_row_ids(self.connection, 'reconciliation_notes', 'ref', 'value', keep_ref))
+
+    def expire_checker_marker_offer(self, offer_id):
+        if managed_resource('offer', offer_id):
+            return
+        row = self.find_offer((offer_id,)).fetchone()
+        if row and is_checker_marker(row['code']):
+            self.connection.execute('DELETE FROM vip_offers WHERE id=?', (offer_id,))
+
+    def expire_checker_marker_reconciliations(self, refs):
+        for ref in refs:
+            row = self.connection.execute('SELECT id,value FROM reconciliation_notes WHERE ref=?', (ref,)).fetchone()
+            if row and not managed_resource('reconciliation', row['id']) and is_checker_marker(row['value']):
+                self.connection.execute('DELETE FROM reconciliation_notes WHERE ref=?', (ref,))

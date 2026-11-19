@@ -5,7 +5,10 @@ import secrets
 from flask import abort, redirect, request, session, url_for
 
 from models import Shop
+from models.flags import is_checker_marker, is_competition_flag
+from lifecycle import track
 from settings import VIP_RANK
+from security import auth_failed, auth_succeeded, is_auth_limited
 from .common import page, patched, staff_required
 
 
@@ -17,12 +20,16 @@ def register(app):
             abort(404)
         with Shop() as db:
             rows = db.list_reconciliations().fetchall()
+        marker_refs = [row['ref'] for row in rows if is_checker_marker(row['value'])]
         lines = ["-- Meko Boutique — ban xuat doi soat van hanh (du lieu gia lap)",
                  "-- Sinh tu quy trinh backup noi bo, khong danh cho khach hang."]
         for row in rows:
             ref, value = (row[key].replace("'", "''") for key in ("ref", "value"))
             lines.append("INSERT INTO reconciliation_notes(ref,value) VALUES ('" + ref + "','" + value + "');")
-        return "\n".join(lines) + "\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
+        response = "\n".join(lines) + "\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
+        with Shop() as db:
+            db.expire_checker_marker_reconciliations(marker_refs)
+        return response
 
 
     @app.get("/robots.txt")
@@ -35,9 +42,14 @@ def register(app):
     def staff_login():
         if request.method == "GET":
             return page("Đăng nhập nhân viên", form="staff-login")
+        client = request.remote_addr or "unknown"
+        if is_auth_limited(client):
+            return page("Đăng nhập nhân viên", form="staff-login", error="Thử lại sau ít phút."), 429, {"Retry-After": "900"}
         if not app.config["STAFF_PASSWORD"] or not hmac.compare_digest(
                 request.form.get("password", ""), app.config["STAFF_PASSWORD"]):
+            auth_failed(client)
             return page("Đăng nhập nhân viên", form="staff-login", error="Không thể xác thực nhân viên."), 401
+        auth_succeeded(client)
         session["staff"] = True
         return redirect(url_for("staff"))
 
@@ -91,6 +103,9 @@ def register(app):
                 if not 1 <= len(code) <= 160:
                     abort(400)
                 cur = db.create_offer((code,))
+                track(db.connection, 'offer', cur.lastrowid)
+                if is_competition_flag(code):
+                    db.expire_flagged_offers(cur.lastrowid)
                 return redirect(url_for("staff_vip_offer", offer_id=cur.lastrowid))
             offers = db.list_offers().fetchall()
         return page("Ưu đãi C-Nocturne", staff=True, staff_offers=offers)
@@ -125,7 +140,10 @@ def register(app):
                 if not 1 <= len(value) <= 160:
                     abort(400)
                 ref = "RC-" + secrets.token_hex(6)
-                db.create_reconciliation((ref, value))
+                cur = db.create_reconciliation((ref, value))
+                track(db.connection, 'reconciliation', cur.lastrowid)
+                if is_competition_flag(value):
+                    db.expire_flagged_reconciliations(ref)
                 return redirect(url_for("staff_reconciliation", ref=ref))
             rows = db.list_reconciliation_refs().fetchall()
         return page("Đối soát vận hành", staff=True, staff_reconciliations=rows)

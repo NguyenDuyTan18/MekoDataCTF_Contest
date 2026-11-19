@@ -4,6 +4,8 @@ import secrets
 from flask import abort, redirect, request, session, url_for
 
 from models import Shop
+from models.flags import is_competition_flag
+from lifecycle import track
 from .common import page, patched, user_required, _cart_items
 
 
@@ -47,6 +49,9 @@ def register(app):
             cur = db.create_order((code, session["uid"], total, memo))
             oid = cur.lastrowid
             db.create_order_items([(oid, x["id"], x["quantity"], x["price"]) for x in items])
+            track(db.connection, 'order', oid)
+            if is_competition_flag(memo):
+                db.expire_flagged_orders(oid)
         session["cart"] = {}
         return redirect(url_for("invoice", order_id=oid))
 
@@ -70,5 +75,8 @@ def register(app):
             if patched("invoices") and order["user_id"] != session["uid"]:
                 abort(403)
             lines = db.list_order_items((order_id,)).fetchall()
-        return page("Hóa đơn", invoice=order, invoice_items=lines)
+        response = page("Hóa đơn", invoice=order, invoice_items=lines)
+        with Shop() as db:
+            db.expire_checker_marker_order(order_id)
+        return response
 

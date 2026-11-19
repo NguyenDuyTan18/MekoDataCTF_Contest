@@ -47,12 +47,18 @@ def functional(client, task):
 
 def run(payload, config):
     task, action, ip = (payload.get(k) for k in ('task', 'action', 'ip'))
-    if task not in SERVICES or action not in ('check', 'put', 'get') or ip not in config['teams']:
+    if task not in SERVICES or action not in ('check', 'put', 'get', 'reset', 'prune') or ip not in config['teams']:
         return {'status': CHECK_FAILED, 'public': 'Invalid checker request', 'private': ''}
     team = config['teams'][ip]
     port = team.get('ports', SERVICES)[task]
     try:
         with Client(team.get('host', ip), port, timeout=config.get('timeout', 4)) as client:
+            if action in ('reset', 'prune'):
+                arguments = {'before_tick': int(payload['before_tick'])} if action == 'prune' else {}
+                result = client.call(op=action, token=team['token'], **arguments)
+                if not result.get('ok'):
+                    raise ValueError('maintenance rejected')
+                return {'status': UP, 'public': 'Crypto maintenance complete', 'private': ''}
             if action == 'check':
                 functional(client, task)
                 return {'status': UP, 'public': 'Crypto service UP', 'private': ''}

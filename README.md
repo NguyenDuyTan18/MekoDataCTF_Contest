@@ -99,3 +99,56 @@ Khóa cũ không còn được đọc. Sau khi cập nhật, restart `meko-bouti
 ## Kiểm tra cục bộ
 
 Trong Python có Flask, PyYAML, ecdsa và pycryptodome, chạy `python -m unittest discover -s tests` từ gốc gói.
+
+## Vòng đời dữ liệu checker
+
+Source đã được đối chiếu với hai bản đang chạy trên team3 được sao chép tại
+`Desktop/team3-source-20261119/meko-boutique` và `meko-crypto`.
+
+- `check()` tạo marker `meko-…`, kiểm tra rồi dọn toàn bộ nhóm tài nguyên thử,
+  gồm tài khoản, đơn hàng, ghi chú, ưu đãi, outfit và file manifest/private.
+  Client cũ không gửi chữ ký vẫn được dọn marker sau khi app tạo phản hồi đọc.
+- `put()` dùng key ổn định để retry trả về cùng bản ghi. Sau khi đọc lại flag mới
+  thành công, checker kích hoạt nhóm mới và dọn nhóm cũ cùng task. Nếu PUT mới lỗi,
+  nhóm đang hoạt động được giữ nguyên và phần ghi dở được dọn.
+- Mỗi task Web giữ **một flag đang hoạt động**, giống bản team3. Các task không
+  xóa dữ liệu của nhau. Không cần gửi thêm metadata lifecycle từ ForcAD cho cơ chế
+  này. Chữ ký và thao tác dọn nội bộ dùng khóa staff đã có trong provisioning.
+- Outfit giữ alias `simulation/private/current.json` trỏ đến token hiện tại.
+  Đường preview `../private/current.json` vẫn đọc flag khi chưa vá; chế độ patched
+  tiếp tục chặn traversal. Alias được ghi atomic và khôi phục khi restart.
+- Bản xuất vận hành không giới hạn 100 dòng. Upload thất bại dọn file đã ghi dở.
+- Crypto dùng cơ chế của bản Desktop: tick mới thay flag cũ, retry cùng key không
+  tăng số record, request tick thấp hơn bị từ chối, restart tiến trình giữ tick.
+
+**Tương thích ForcAD:** chính sách một flag chỉ phù hợp khi GET nhắm flag hiện tại.
+Source ForcAD từng được đối chiếu tại `competition.verify()` vẫn GET ba tick
+`max(1,tick-2)..tick`. Nếu dùng đúng bản ForcAD đó, cần đổi cửa sổ GET về tick hiện
+tại trước khi thi với chính sách một flag này; nếu không, GET flag đã thay sẽ CORRUPT.
+Source ForcAD ngoài repo chưa được sửa trong phiên này.
+
+### Bắt đầu lại cuộc thi Crypto
+
+BTC đóng cuộc thi, dừng/drain các job checker cũ rồi gọi agent bằng quyền quản trị
+cho **từng task và từng IP đội**, trước khi bắt đầu đặt flag mới:
+
+```bash
+printf '%s' '{"action":"reset","task":"curveball","ip":"10.90.0.11"}' |
+  sudo -n /usr/bin/python3 /opt/crypto-checker/agent.py --config /etc/crypto-checker/config.json
+```
+
+Lặp cho `curveball`, `padding_oracle`, `ecdsa_nonce` và ba IP đội. Agent dùng token
+trong config để xác thực. Reset xóa flag và đặt tick về -1, giữ nguyên khóa mật mã
+của challenge. Không tự reset khi nhận PUT tick thấp vì đó có thể là retry cũ.
+
+### Đưa vào pool mới
+
+Giữ đủ `app/`, `checker/`, `round2/crypto_ad/` và `provisioning/` trong revision
+Git dùng để tạo Sandbox Definition. Playbook cài app Web, service Crypto và hai
+agent tương ứng; schema được tạo/nâng cấp khi khởi động. Không đưa database thi,
+khóa, thư mục backup hoặc `__pycache__` từ Desktop vào repo. Cây challenge Crypto
+bị lồng nhầm `challenges/challenges` trên VM tham chiếu đã được loại khỏi nguồn cài.
+
+Các thư mục Desktop là source tham chiếu, không bị chỉnh sửa. Các ghi chú audit cũ
+trong `contexts/` mô tả thời điểm trước khi ghép source; chính sách hiện tại nằm
+trong mục này.

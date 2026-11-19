@@ -4,15 +4,19 @@ import secrets
 import sqlite3
 from pathlib import Path
 
-from flask import current_app
+from flask import current_app, g
 from werkzeug.security import generate_password_hash
 
 from settings import ROOT, TASKS
+
+SQLITE_MAX_PAGES = 32768  # 128 MiB per database at SQLite's default 4 KiB page size.
 
 
 def connect(path):
     con = sqlite3.connect(path, timeout=10)
     con.row_factory = sqlite3.Row
+    con.execute(f"PRAGMA max_page_count={SQLITE_MAX_PAGES}")
+    con.execute("PRAGMA busy_timeout=10000")
     return con
 
 
@@ -20,11 +24,18 @@ class Repository:
     database = "shop.sqlite3"
 
     def __enter__(self):
+        if g.get('checker_db') is not None:
+            self.connection = g.checker_db
+            self.borrowed = True
+            return self
+        self.borrowed = False
         self.connection = connect(Path(current_app.config["DATA_DIR"]) / self.database)
         self.connection.__enter__()
         return self
 
     def __exit__(self, *exc):
+        if self.borrowed:
+            return False
         try:
             return self.connection.__exit__(*exc)
         finally:
@@ -32,7 +43,7 @@ class Repository:
 
 
 def initialize(app):
-    data = Path(app.config["DATA_DIR"])
+    data = Path(app.config["DATA_DIR"]).resolve()
     data.mkdir(parents=True, exist_ok=True)
     app.config["DATA_DIR"] = data
 
@@ -84,8 +95,22 @@ def initialize(app):
             CREATE TABLE IF NOT EXISTS coupons(code TEXT PRIMARY KEY, discount INTEGER, note TEXT);
             CREATE TABLE IF NOT EXISTS vip_offers(id INTEGER PRIMARY KEY, code TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS reconciliation_notes(id INTEGER PRIMARY KEY, ref TEXT UNIQUE NOT NULL, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS checker_groups(id TEXT PRIMARY KEY, mode TEXT NOT NULL, run_id TEXT, tick INTEGER, expires_tick INTEGER);
+            CREATE TABLE IF NOT EXISTS checker_resources(group_id TEXT, kind TEXT, record TEXT, PRIMARY KEY(group_id,kind,record));
+            CREATE TABLE IF NOT EXISTS checker_receipts(key TEXT PRIMARY KEY, status INTEGER, headers TEXT, body BLOB);
+            CREATE TABLE IF NOT EXISTS checker_file_gc(path TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS checker_windows(run_id TEXT PRIMARY KEY, current_tick INTEGER, oldest_live_tick INTEGER);
+            CREATE TABLE IF NOT EXISTS checker_active(task TEXT PRIMARY KEY, group_id TEXT UNIQUE NOT NULL);
+            CREATE TABLE IF NOT EXISTS checker_retired(group_id TEXT PRIMARY KEY);
             """
         )
+        columns = {row['name'] for row in db.execute('PRAGMA table_info(outfits)')}
+        for column in ('manifest_file', 'note_token'):
+            if column not in columns:
+                db.execute('ALTER TABLE outfits ADD COLUMN ' + column + ' TEXT')
+        group_columns = {row['name'] for row in db.execute('PRAGMA table_info(checker_groups)')}
+        if 'task' not in group_columns:
+            db.execute('ALTER TABLE checker_groups ADD COLUMN task TEXT')
         if not db.execute("SELECT 1 FROM products LIMIT 1").fetchone():
             db.executemany("INSERT INTO products VALUES(?,?,?,?,?,?)",
                            [(p["id"], p["name"], p["category"], p["price"], p["image"], p["description"]) for p in seed["products"]])
